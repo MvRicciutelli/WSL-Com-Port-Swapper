@@ -105,6 +105,10 @@ Read directly from `HKLM\HARDWARE\DEVICEMAP\SERIALCOMM`. No usbipd involvement â
 
 by Matteo Vittorio Ricciutelli â€” 2026
 
+## Credits
+
+- Icon made by [Freepik](https://www.freepik.com) from [www.flaticon.com](https://www.flaticon.com)
+
 ---
 
 ## License

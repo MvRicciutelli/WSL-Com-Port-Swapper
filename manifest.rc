@@ -1,3 +1,6 @@
 // Embeds app.manifest so Windows reads the requestedExecutionLevel at launch.
 // Resource type 24 (RT_MANIFEST), ID 1 = application manifest.
 1 24 "app.manifest"
+
+// Application icon — shown in Explorer, taskbar, and title bar.
+101 ICON "usb-port.ico"

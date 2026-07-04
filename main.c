@@ -65,6 +65,8 @@
 
 #define TIMER_DETACH_REFRESH 1  /**< WM_TIMER id: delayed refresh after detach */
 #define APP_VERSION "1.0"       /**< Shown in the window title bar             */
+#define IDI_APPICON  101        /**< Icon resource ID — usb-port.ico           */
+#define IDM_ABOUT    201        /**< Menu command — Help → About               */
 
 /* ── constants ───────────────────────────────────────────────────────────── */
 
@@ -985,7 +987,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         char args[CMD_SZ];
         char st[320];
 
-        if (id == IDC_WIN_LIST && HIWORD(wp) == LBN_SELCHANGE) {
+        if (id == IDM_ABOUT) {
+            MessageBoxA(hwnd,
+                "WSL COM Port Swapper v" APP_VERSION "\r\n\r\n"
+                "Forward USB serial devices between Windows and WSL2\r\n"
+                "via usbipd-win \x97 no command line required.\r\n\r\n"
+                "Author:  Matteo Vittorio Ricciutelli\r\n"
+                "Icon:    Icon made by Freepik from www.flaticon.com",
+                "About WSL COM Port Swapper",
+                MB_OK | MB_ICONINFORMATION);
+
+        } else if (id == IDC_WIN_LIST && HIWORD(wp) == LBN_SELCHANGE) {
             /*
              * Sync COM spinner to the selected Windows listbox entry.
              * Entry format: "COM4    \\Device\\USBSER000"
@@ -1228,7 +1240,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     wc.lpszClassName = "WslComPortSwapper";
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
-    wc.hIcon         = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hIcon         = LoadIconA(hInst, MAKEINTRESOURCE(IDI_APPICON));
     RegisterClassA(&wc);
 
     /*
@@ -1236,15 +1248,26 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
      * Rightmost control: x=510+150=660, plus 12px padding = 672 client width.
      * Bottom control:    y=246+36=282,  plus 16px padding = 298 client height.
      */
+    /* Build the menu bar before AdjustWindowRect so bMenu=TRUE is accurate */
+    HMENU hMenuBar = CreateMenu();
+    HMENU hHelp    = CreatePopupMenu();
+    AppendMenuA(hHelp,    MF_STRING, IDM_ABOUT, "&About");
+    AppendMenuA(hMenuBar, MF_POPUP, (UINT_PTR)hHelp, "&Help");
+
     DWORD style = WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX;
-    RECT  r     = {0, 0, 672, 322};  /* +24 px for privilege bar + credit row */
-    AdjustWindowRect(&r, style, FALSE);
+    RECT  r     = {0, 0, 672, 322};
+    AdjustWindowRect(&r, style, TRUE);  /* TRUE = has menu bar */
 
     HWND hwnd = CreateWindowA("WslComPortSwapper", "WSL COM Port Swapper v" APP_VERSION,
         style,
         CW_USEDEFAULT, CW_USEDEFAULT,
         r.right - r.left, r.bottom - r.top,
-        NULL, NULL, hInst, NULL);
+        NULL, hMenuBar, hInst, NULL);
+
+    /* Set small taskbar / title-bar icon separately */
+    HICON hSmall = (HICON)LoadImageA(hInst, MAKEINTRESOURCE(IDI_APPICON),
+        IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+    if (hSmall) SendMessage(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hSmall);
 
     ShowWindow(hwnd, nShow);
     UpdateWindow(hwnd);
