@@ -279,12 +279,12 @@ static void find_usbipd(void) {
     if (proc_capture(cmd, out, sizeof(out), 4000) && out[0]) {
         char *nl = strpbrk(out, "\r\n");
         if (nl) *nl = '\0';
-        if (out[0]) { strncpy(g_usbipd, out, MAX_PATH - 1); return; }
+        if (out[0]) { snprintf(g_usbipd, MAX_PATH, "%s", out); return; }
     }
     /* Strategy 2: hard-coded install locations */
     for (int i = 0; USBIPD_LOCS[i]; i++) {
         if (GetFileAttributesA(USBIPD_LOCS[i]) != INVALID_FILE_ATTRIBUTES) {
-            strncpy(g_usbipd, USBIPD_LOCS[i], MAX_PATH - 1);
+            snprintf(g_usbipd, MAX_PATH, "%s", USBIPD_LOCS[i]);
             return;
         }
     }
@@ -708,8 +708,7 @@ static void usbipd_list_devices(void) {
                      : strstr(tmp, "Shared")   ? ST_SHARED
                                                : ST_WINDOWS;
 
-            strncpy(d->display, tmp, sizeof(d->display) - 1);
-            d->display[sizeof(d->display) - 1] = '\0';
+            snprintf(d->display, sizeof(d->display), "%s", tmp);
             g_ndev++;
         }
         if (!end) break;
@@ -739,7 +738,7 @@ static void list_wsl_tty(void) {
         memcpy(tmp, wl, len);
         rtrim(tmp, &len);
         if (tmp[0] == '/') {
-            strncpy(g_tty[g_ntty++], tmp, 63);
+            snprintf(g_tty[g_ntty++], sizeof(g_tty[0]), "%s", tmp);
             SendMessageA(g_wsl_list, LB_ADDSTRING, 0, (LPARAM)tmp);
         }
         if (!we) break;
@@ -808,7 +807,7 @@ static HWND make_spinner(HWND hwnd, HINSTANCE hInst,
                           int ex, int ey, int ew,
                           int def_val, HFONT hfont) {
     HWND hEdit = CreateWindowA("EDIT", "",
-        WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER,
+        WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER|ES_AUTOHSCROLL,
         ex, ey, ew, 22, hwnd, (HMENU)(INT_PTR)edit_id, hInst, NULL);
     SendMessage(hEdit, WM_SETFONT, (WPARAM)hfont, TRUE);
 
@@ -879,7 +878,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * of usbipd status.
          */
         g_win_list = CreateWindowA("LISTBOX", NULL,
-            WS_CHILD|WS_VISIBLE|WS_BORDER|WS_HSCROLL|WS_VSCROLL|LBS_NOINTEGRALHEIGHT,
+            WS_CHILD|WS_VISIBLE|WS_BORDER|WS_HSCROLL|WS_VSCROLL|LBS_NOINTEGRALHEIGHT|LBS_NOTIFY,
             8, 26, 320, 168, hwnd, (HMENU)IDC_WIN_LIST, hInst, NULL);
         SendMessage(g_win_list, WM_SETFONT, (WPARAM)mono, TRUE);
 
@@ -911,7 +910,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * inside WSL.  Shows which tty devices are currently available in WSL.
          */
         g_wsl_list = CreateWindowA("LISTBOX", NULL,
-            WS_CHILD|WS_VISIBLE|WS_BORDER|WS_HSCROLL|WS_VSCROLL|LBS_NOINTEGRALHEIGHT,
+            WS_CHILD|WS_VISIBLE|WS_BORDER|WS_HSCROLL|WS_VSCROLL|LBS_NOINTEGRALHEIGHT|LBS_NOTIFY,
             340, 26, 320, 168, hwnd, (HMENU)IDC_WSL_LIST, hInst, NULL);
         SendMessage(g_wsl_list, WM_SETFONT, (WPARAM)mono, TRUE);
 
