@@ -380,70 +380,80 @@ static int vidpid_for_com(int n, char *out) {
     char want[16];
     snprintf(want, sizeof(want), "COM%d", n);
 
-    HKEY hUsb;
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
-                      "SYSTEM\\CurrentControlSet\\Enum\\USB",
-                      0, KEY_READ | KEY_ENUMERATE_SUB_KEYS, &hUsb) != ERROR_SUCCESS)
-        return 0;
+    /* FTDI's VCP driver enumerates the serial port under a child
+     * "FTDIBUS" bus node (key names use '+' separators, e.g.
+     * "VID_0403+PID_6001+<serial>") instead of directly under Enum\USB,
+     * so PortName never shows up there for FTDI-based adapters. */
+    static const char *roots[] = {
+        "SYSTEM\\CurrentControlSet\\Enum\\USB",
+        "SYSTEM\\CurrentControlSet\\Enum\\FTDIBUS",
+    };
 
     int found = 0;
-    char dev_key[128];
-    DWORD dev_idx = 0, dev_len;
-
-    while (!found) {
-        dev_len = sizeof(dev_key);
-        if (RegEnumKeyExA(hUsb, dev_idx++, dev_key, &dev_len,
-                          NULL, NULL, NULL, NULL) != ERROR_SUCCESS)
-            break;
-
-        /* Key name format: "VID_10C4&PID_EA60" or "VID_10C4&PID_EA60&MI_00" */
-        const char *vp = strstr(dev_key, "VID_");
-        const char *pp = strstr(dev_key, "PID_");
-        if (!vp || !pp) continue;
-
-        char vid[8] = {0}, pid_s[8] = {0};
-        int  i;
-        for (i = 0; i < 4 && isxdigit((unsigned char)vp[4+i]); i++)
-            vid[i]   = (char)tolower((unsigned char)vp[4+i]);
-        for (i = 0; i < 4 && isxdigit((unsigned char)pp[4+i]); i++)
-            pid_s[i] = (char)tolower((unsigned char)pp[4+i]);
-        if (!vid[0] || !pid_s[0]) continue;
-
-        /* Enumerate instance sub-keys (serial number or "0000") */
-        HKEY hDev;
-        if (RegOpenKeyExA(hUsb, dev_key, 0,
-                          KEY_READ | KEY_ENUMERATE_SUB_KEYS, &hDev) != ERROR_SUCCESS)
+    for (size_t r = 0; !found && r < sizeof(roots) / sizeof(roots[0]); r++) {
+        HKEY hUsb;
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, roots[r],
+                          0, KEY_READ | KEY_ENUMERATE_SUB_KEYS, &hUsb) != ERROR_SUCCESS)
             continue;
 
-        char inst[128];
-        DWORD inst_idx = 0, inst_len;
+        char dev_key[128];
+        DWORD dev_idx = 0, dev_len;
+
         while (!found) {
-            inst_len = sizeof(inst);
-            if (RegEnumKeyExA(hDev, inst_idx++, inst, &inst_len,
+            dev_len = sizeof(dev_key);
+            if (RegEnumKeyExA(hUsb, dev_idx++, dev_key, &dev_len,
                               NULL, NULL, NULL, NULL) != ERROR_SUCCESS)
                 break;
 
-            /* Check Device Parameters\PortName under this instance */
-            char param_path[256];
-            snprintf(param_path, sizeof(param_path), "%s\\Device Parameters", inst);
-            HKEY hParam;
-            if (RegOpenKeyExA(hDev, param_path, 0, KEY_READ, &hParam) != ERROR_SUCCESS)
+            /* Key name format: "VID_10C4&PID_EA60" or "VID_10C4&PID_EA60&MI_00" */
+            const char *vp = strstr(dev_key, "VID_");
+            const char *pp = strstr(dev_key, "PID_");
+            if (!vp || !pp) continue;
+
+            char vid[8] = {0}, pid_s[8] = {0};
+            int  i;
+            for (i = 0; i < 4 && isxdigit((unsigned char)vp[4+i]); i++)
+                vid[i]   = (char)tolower((unsigned char)vp[4+i]);
+            for (i = 0; i < 4 && isxdigit((unsigned char)pp[4+i]); i++)
+                pid_s[i] = (char)tolower((unsigned char)pp[4+i]);
+            if (!vid[0] || !pid_s[0]) continue;
+
+            /* Enumerate instance sub-keys (serial number or "0000") */
+            HKEY hDev;
+            if (RegOpenKeyExA(hUsb, dev_key, 0,
+                              KEY_READ | KEY_ENUMERATE_SUB_KEYS, &hDev) != ERROR_SUCCESS)
                 continue;
 
-            char port_name[16];
-            DWORD plen = sizeof(port_name), type;
-            if (RegQueryValueExA(hParam, "PortName", NULL, &type,
-                                  (BYTE *)port_name, &plen) == ERROR_SUCCESS
-                && type == REG_SZ
-                && strcmp(port_name, want) == 0) {
-                snprintf(out, VIDPID_SZ, "%s:%s", vid, pid_s);
-                found = 1;
+            char inst[128];
+            DWORD inst_idx = 0, inst_len;
+            while (!found) {
+                inst_len = sizeof(inst);
+                if (RegEnumKeyExA(hDev, inst_idx++, inst, &inst_len,
+                                  NULL, NULL, NULL, NULL) != ERROR_SUCCESS)
+                    break;
+
+                /* Check Device Parameters\PortName under this instance */
+                char param_path[256];
+                snprintf(param_path, sizeof(param_path), "%s\\Device Parameters", inst);
+                HKEY hParam;
+                if (RegOpenKeyExA(hDev, param_path, 0, KEY_READ, &hParam) != ERROR_SUCCESS)
+                    continue;
+
+                char port_name[16];
+                DWORD plen = sizeof(port_name), type;
+                if (RegQueryValueExA(hParam, "PortName", NULL, &type,
+                                      (BYTE *)port_name, &plen) == ERROR_SUCCESS
+                    && type == REG_SZ
+                    && strcmp(port_name, want) == 0) {
+                    snprintf(out, VIDPID_SZ, "%s:%s", vid, pid_s);
+                    found = 1;
+                }
+                RegCloseKey(hParam);
             }
-            RegCloseKey(hParam);
+            RegCloseKey(hDev);
         }
-        RegCloseKey(hDev);
+        RegCloseKey(hUsb);
     }
-    RegCloseKey(hUsb);
     return found;
 }
 
