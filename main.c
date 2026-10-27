@@ -2,7 +2,9 @@
  * @file main.c
  * @brief WSL COM Port Swapper — Win32 GUI for usbipd-win USB forwarding.
  *
- * Layout: two listboxes side by side.
+ * Layout: two tabs, each with two listboxes side by side.
+ *
+ * "Serial (COM)" tab:
  *   Left  — Windows COM ports read from the system registry
  *            (HKLM\HARDWARE\DEVICEMAP\SERIALCOMM).  Always populated,
  *            no usbipd dependency for the listing step.
@@ -12,6 +14,13 @@
  * panel bind and forward the chosen COM port into WSL via usbipd.
  * A ttyUSB/ACM number spinner and "<- Return to Windows" button below
  * the right panel detach the device back to Windows.
+ *
+ * "Bluetooth" tab:
+ *   Left  — USB Bluetooth adapters from `usbipd list`.
+ *   Right — Bluetooth controllers the WSL kernel sees (/sys/class/bluetooth).
+ *
+ * "-> Attach to WSL" force-binds the selected adapter (Windows loses it),
+ * attaches it and loads the btusb module; "<- Return to Windows" unbinds it.
  *
  * usbipd is still needed for bind/attach/detach, but only a background
  * `usbipd list` run is needed for BUSID lookup; the visible COM-port list
@@ -62,6 +71,12 @@
 #define IDC_PRIV      111  /**< STATIC — privilege / elevation indicator      */
 #define IDC_USBIPD_ST 112  /**< STATIC — usbipd install / found indicator     */
 #define IDC_CREDIT    113  /**< STATIC — author credit line                   */
+#define IDC_TABS      114  /**< TAB — Serial (COM) / Bluetooth pages          */
+#define IDC_BT_LIST   115  /**< LISTBOX — Windows USB Bluetooth adapters      */
+#define IDC_BT_WSL    116  /**< LISTBOX — WSL Bluetooth controllers (hci*)    */
+#define IDC_BT_TO_WSL 117  /**< Push-button — force-bind + attach adapter     */
+#define IDC_BT_TO_WIN 118  /**< Push-button — unbind adapter back to Windows  */
+#define IDC_UNSTICK   119  /**< Push-button — free stuck WSL-side usbip ports */
 
 #define TIMER_DETACH_REFRESH 1  /**< WM_TIMER id: delayed refresh after detach */
 #define APP_VERSION "1.0"       /**< Shown in the window title bar             */
@@ -75,6 +90,10 @@
 #define VIDPID_SZ  16   /**< Max VID:PID string ("10c4:ea60")               */
 #define CMD_SZ     640  /**< Process command-line buffer                    */
 #define RAW_SZ     8192 /**< stdout capture buffer                          */
+
+/** WSL usbip virtual host controller (sysfs status / detach files).
+ *  ponytail: first controller only; vhci_hcd.1+ appear only past 8 devices. */
+#define VHCI_SYSFS "/sys/devices/platform/vhci_hcd.0"
 
 /** Device present in Windows; not bound to usbipd. */
 #define ST_WINDOWS 0
@@ -130,6 +149,13 @@ static HWND g_com_spin   = NULL; /**< COM-number UPDOWN.                  */
 static HWND g_tty_spin   = NULL; /**< tty-suffix UPDOWN.                  */
 static HWND g_priv_label   = NULL; /**< Privilege / elevation indicator.        */
 static HWND g_usbipd_label = NULL; /**< usbipd install / found indicator.       */
+static HWND g_tabs         = NULL; /**< Serial / Bluetooth tab control.         */
+static HWND g_bt_list      = NULL; /**< Windows Bluetooth adapter listbox.      */
+static HWND g_bt_wsl       = NULL; /**< WSL Bluetooth controller listbox.       */
+/** @brief Controls shown on each tab page (index = tab); unused slots NULL. */
+static HWND g_pages[2][12];
+/** @brief Number of Bluetooth adapters shown in g_bt_list. */
+static int  g_nbt = 0;
 /** @brief Cached elevation state (set once at startup, shown in g_priv_label). */
 static int  g_elevated_cache = 0;
 
@@ -294,12 +320,14 @@ static void find_usbipd(void) {
 /* ── string helpers ──────────────────────────────────────────────────────── */
 
 /**
- * @brief Strip trailing CR, LF, and spaces from @p s in place.
+ * @brief NUL-terminate @p s at @p len, then strip trailing CR, LF, and spaces.
  *
- * @param s    Mutable NUL-terminated string.
+ * @param s    Mutable buffer of at least @p len + 1 bytes (need not be
+ *             NUL-terminated yet, e.g. right after a memcpy).
  * @param len  Current string length; updated to the new length on return.
  */
 static void rtrim(char *s, int *len) {
+    s[*len] = '\0';
     while (*len > 0 && (s[*len-1] == '\r' || s[*len-1] == '\n' ||
                          s[*len-1] == ' '))
         s[--(*len)] = '\0';
@@ -757,13 +785,71 @@ static void list_wsl_tty(void) {
 }
 
 /**
- * @brief Refresh both listboxes and the status bar.
+ * @brief Populate both Bluetooth-tab listboxes.
+ *
+ * Left  — g_devs[] entries whose usbipd description contains "Bluetooth",
+ *         shown as "BUSID  VID:PID  STATE".  The first row is pre-selected
+ *         so the attach/return buttons work without a click.
+ *         usbipd_list_devices() must have run first.
+ * Right — `ls /sys/class/bluetooth` inside WSL (hci0, hci1, ...), i.e. the
+ *         controllers the WSL kernel has bound with btusb.
+ *
+ * Updates g_nbt with the count of adapters added.
+ */
+static void list_bluetooth(void) {
+    SendMessage(g_bt_list, LB_RESETCONTENT, 0, 0);
+    g_nbt = 0;
+    for (int i = 0; i < g_ndev; i++) {
+        /* ponytail: name match only; relies on the driver's friendly name,
+         * e.g. "Intel(R) Wireless Bluetooth(R)" */
+        if (!strstr(g_devs[i].display, "Bluetooth")) continue;
+
+        /* STATE is the last column; usbipd separates columns with 2+ spaces */
+        const char *st = g_devs[i].display, *p;
+        for (p = st; (p = strstr(p, "  ")) != NULL; p++) st = p;
+        while (*st == ' ') st++;
+
+        char disp[128];
+        snprintf(disp, sizeof(disp), "%-6s %s  %s",
+                 g_devs[i].busid, g_devs[i].vidpid, st);
+        SendMessageA(g_bt_list, LB_ADDSTRING, 0, (LPARAM)disp);
+        g_nbt++;
+    }
+    SendMessage(g_bt_list, LB_SETCURSEL, 0, 0);
+
+    SendMessage(g_bt_wsl, LB_RESETCONTENT, 0, 0);
+    char raw[RAW_SZ] = {0};
+    wsl_capture("ls /sys/class/bluetooth 2>/dev/null", raw, sizeof(raw));
+    for (char *tok = strtok(raw, " \r\n"); tok; tok = strtok(NULL, " \r\n"))
+        if (strncmp(tok, "hci", 3) == 0)
+            SendMessageA(g_bt_wsl, LB_ADDSTRING, 0, (LPARAM)tok);
+}
+
+/**
+ * @brief Read the BUSID of the selected Bluetooth adapter row.
+ *
+ * Rows are formatted by list_bluetooth() with the BUSID as first token.
+ *
+ * @param out  Buffer of at least BUSID_SZ bytes.
+ * @return     Non-zero if a row is selected.
+ */
+static int bt_busid(char *out) {
+    int sel = (int)SendMessage(g_bt_list, LB_GETCURSEL, 0, 0);
+    if (sel == LB_ERR) return 0;
+    char text[128] = {0};
+    SendMessageA(g_bt_list, LB_GETTEXT, sel, (LPARAM)text);
+    return sscanf(text, "%15s", out) == 1;
+}
+
+/**
+ * @brief Refresh all listboxes and the status bar.
  *
  * 1. Reads Windows COM ports from the registry into the left listbox.
  * 2. Runs `usbipd list` in the background to populate g_devs[]
  *    (needed for BUSID lookup; not shown directly).
  * 3. Queries WSL for /dev/tty* devices; populates the right listbox.
- * 4. Updates the status bar with counts and any warnings.
+ * 4. Fills the Bluetooth tab from g_devs[] and WSL /sys/class/bluetooth.
+ * 5. Updates the status bar with counts and any warnings.
  *
  * The Refresh button is disabled during the operation.
  */
@@ -774,19 +860,20 @@ static void refresh(void) {
     list_registry_com_ports();
     usbipd_list_devices();
     list_wsl_tty();
+    list_bluetooth();
 
     /* Build status message */
     char st[320];
-    if (g_ncom == 0 && g_ntty == 0) {
+    if (g_ncom == 0 && g_ntty == 0 && g_nbt == 0) {
         snprintf(st, sizeof(st),
-            "No COM ports or WSL tty devices found."
+            "No COM ports, WSL tty devices or Bluetooth adapters found."
             "%s",
             g_usbipd[0] ? "" : "  usbipd not found (attach/detach unavailable).");
     } else {
         const char *elev = is_elevated() ? "" : "  [Run as Administrator for attach/detach]";
         const char *usb  = g_usbipd[0] ? "" : "  [usbipd not found]";
-        snprintf(st, sizeof(st), "%d COM port(s)   %d WSL tty(s)%s%s",
-                 g_ncom, g_ntty, elev, usb);
+        snprintf(st, sizeof(st), "%d COM port(s)   %d WSL tty(s)   %d Bluetooth adapter(s)%s%s",
+                 g_ncom, g_ntty, g_nbt, elev, usb);
     }
     SetWindowTextA(g_status, st);
     EnableWindow(GetDlgItem(g_hwnd, IDC_REFRESH), TRUE);
@@ -844,26 +931,46 @@ static int spin_val(HWND h) {
     return (int)(short)LOWORD(SendMessage(h, UDM_GETPOS, 0, 0));
 }
 
+/**
+ * @brief Show the controls of tab page @p tab and hide the others.
+ *
+ * @param tab  Tab index (0 = Serial, 1 = Bluetooth).
+ */
+static void show_tab(int tab) {
+    for (int p = 0; p < 2; p++)
+        for (int i = 0; i < 12; i++)
+            if (g_pages[p][i])
+                ShowWindow(g_pages[p][i], p == tab ? SW_SHOW : SW_HIDE);
+}
+
 /* ── window procedure ────────────────────────────────────────────────────── */
 
 /**
  * @brief Main window message procedure.
  *
- * **WM_CREATE** — creates the two-column layout:
- *   Left (x=8, w=320):
+ * **WM_CREATE** — creates a tab control holding two-column pages:
+ *   Serial tab, left (x=14, w=320):
  *     "Windows COM Ports" label, COM listbox, "COM port #:" label,
  *     COM spinner (default 4), "-> Attach to WSL" button.
- *   Right (x=340, w=320):
+ *   Serial tab, right (x=346, w=320):
  *     "WSL tty Ports" label, tty listbox, "ttyUSB/ACM #:" label,
  *     tty spinner (default 0), "<- Return to Windows" button.
- *   Bottom row: "Refresh" button, status label.
+ *   Bluetooth tab: adapter listbox + "-> Attach to WSL" on the left,
+ *     WSL hci listbox + "<- Return to Windows" on the right.
+ *   Bottom row (below the tabs): "Refresh" button, status label.
  *   Calls refresh() on startup.
  *
  * **WM_COMMAND**:
- *   IDC_REFRESH — calls refresh().
- *   IDC_TO_WSL  — reads COM spinner → busid_for_com() → usbipd bind + attach.
- *   IDC_TO_WIN  — re-runs usbipd list → reads tty spinner → busid_for_tty()
- *                 (WSL sysfs VID:PID lookup) → usbipd detach.
+ *   IDC_REFRESH   — calls refresh().
+ *   IDC_TO_WSL    — reads COM spinner → busid_for_com() → usbipd bind + attach.
+ *   IDC_TO_WIN    — re-runs usbipd list → reads tty spinner → busid_for_tty()
+ *                   (WSL sysfs VID:PID lookup) → usbipd detach.
+ *   IDC_BT_TO_WSL — selected adapter → usbipd bind --force + attach,
+ *                   then `modprobe btusb` in WSL.
+ *   IDC_BT_TO_WIN — selected adapter → usbipd unbind.
+ *   IDC_UNSTICK   — in-use vhci ports in WSL → echo port > vhci_hcd.0/detach.
+ *
+ * **WM_NOTIFY** — TCN_SELCHANGE switches the visible tab page.
  *
  * **WM_DESTROY** — posts WM_QUIT.
  */
@@ -876,11 +983,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HFONT mono = (HFONT)GetStockObject(ANSI_FIXED_FONT);
         HFONT gui  = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
-        /* ── Left column (x=8, panel width=320) ── */
+        /* ── Serial tab, left column (x=14, panel width=320) ── */
 
         /** Panel label */
         HWND lbl_w = CreateWindowA("STATIC", "Windows COM Ports",
-            WS_CHILD|WS_VISIBLE, 8, 8, 320, 16, hwnd, NULL, hInst, NULL);
+            WS_CHILD|WS_VISIBLE, 14, 38, 320, 16, hwnd, NULL, hInst, NULL);
 
         /**
          * COM port listbox — populated from HKLM\HARDWARE\DEVICEMAP\SERIALCOMM.
@@ -889,31 +996,31 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          */
         g_win_list = CreateWindowA("LISTBOX", NULL,
             WS_CHILD|WS_VISIBLE|WS_BORDER|WS_HSCROLL|WS_VSCROLL|LBS_NOINTEGRALHEIGHT|LBS_NOTIFY,
-            8, 26, 320, 168, hwnd, (HMENU)IDC_WIN_LIST, hInst, NULL);
+            14, 56, 320, 168, hwnd, (HMENU)IDC_WIN_LIST, hInst, NULL);
         SendMessage(g_win_list, WM_SETFONT, (WPARAM)mono, TRUE);
 
         /** "COM port #:" label aligned with the spinner */
         HWND lbl_cn = CreateWindowA("STATIC", "COM port #:",
-            WS_CHILD|WS_VISIBLE, 8, 206, 82, 16, hwnd, NULL, hInst, NULL);
+            WS_CHILD|WS_VISIBLE, 14, 236, 82, 16, hwnd, NULL, hInst, NULL);
 
         /**
-         * COM number spinner.  EDIT at x=94, width 58 (arrows overlay right
+         * COM number spinner.  EDIT at x=100, width 58 (arrows overlay right
          * ~18px).  Default value 4 — COM4 is the typical ESP32 port.
          */
         g_com_spin = make_spinner(hwnd, hInst,
                                    IDC_COM_EDIT, IDC_COM_SPIN,
-                                   94, 202, 58, 4, gui);
+                                   100, 232, 58, 4, gui);
 
         /** Attach button — runs usbipd bind then usbipd attach --wsl */
         HWND btn_wsl = CreateWindowA("BUTTON", "-> Attach to WSL",
             WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
-            160, 200, 164, 28, hwnd, (HMENU)IDC_TO_WSL, hInst, NULL);
+            166, 230, 164, 28, hwnd, (HMENU)IDC_TO_WSL, hInst, NULL);
 
-        /* ── Right column (x=340, panel width=320) ── */
+        /* ── Serial tab, right column (x=346, panel width=320) ── */
 
         /** Panel label */
         HWND lbl_t = CreateWindowA("STATIC", "WSL tty Ports",
-            WS_CHILD|WS_VISIBLE, 340, 8, 320, 16, hwnd, NULL, hInst, NULL);
+            WS_CHILD|WS_VISIBLE, 346, 38, 320, 16, hwnd, NULL, hInst, NULL);
 
         /**
          * WSL tty listbox — populated from `ls /dev/ttyUSB* /dev/ttyACM*`
@@ -921,42 +1028,77 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          */
         g_wsl_list = CreateWindowA("LISTBOX", NULL,
             WS_CHILD|WS_VISIBLE|WS_BORDER|WS_HSCROLL|WS_VSCROLL|LBS_NOINTEGRALHEIGHT|LBS_NOTIFY,
-            340, 26, 320, 168, hwnd, (HMENU)IDC_WSL_LIST, hInst, NULL);
+            346, 56, 320, 168, hwnd, (HMENU)IDC_WSL_LIST, hInst, NULL);
         SendMessage(g_wsl_list, WM_SETFONT, (WPARAM)mono, TRUE);
 
         /** "ttyUSB/ACM #:" label aligned with the tty spinner */
         HWND lbl_tn = CreateWindowA("STATIC", "ttyUSB/ACM #:",
-            WS_CHILD|WS_VISIBLE, 340, 206, 100, 16, hwnd, NULL, hInst, NULL);
+            WS_CHILD|WS_VISIBLE, 346, 236, 100, 16, hwnd, NULL, hInst, NULL);
 
         /**
-         * tty number spinner.  EDIT at x=444, default 0 (ttyUSB0 / ttyACM0).
+         * tty number spinner.  EDIT at x=450, default 0 (ttyUSB0 / ttyACM0).
          * busid_for_tty() tries ttyUSBn first, then ttyACMn.
          */
         g_tty_spin = make_spinner(hwnd, hInst,
                                    IDC_TTY_EDIT, IDC_TTY_SPIN,
-                                   444, 202, 58, 0, gui);
+                                   450, 232, 58, 0, gui);
 
         /** Detach button — runs usbipd detach to return device to Windows */
         HWND btn_win = CreateWindowA("BUTTON", "<- Return to Windows",
             WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
-            510, 200, 150, 28, hwnd, (HMENU)IDC_TO_WIN, hInst, NULL);
+            516, 230, 150, 28, hwnd, (HMENU)IDC_TO_WIN, hInst, NULL);
 
-        /* ── Bottom row ── */
+        /* ── Bluetooth tab (same grid as the Serial tab) ── */
+
+        HWND lbl_bw = CreateWindowA("STATIC", "Windows Bluetooth Adapters (usbipd)",
+            WS_CHILD, 14, 38, 320, 16, hwnd, NULL, hInst, NULL);
+
+        /** Adapter listbox — "BUSID  VID:PID  STATE" rows from list_bluetooth() */
+        g_bt_list = CreateWindowA("LISTBOX", NULL,
+            WS_CHILD|WS_BORDER|WS_VSCROLL|LBS_NOINTEGRALHEIGHT|LBS_NOTIFY,
+            14, 56, 320, 168, hwnd, (HMENU)IDC_BT_LIST, hInst, NULL);
+        SendMessage(g_bt_list, WM_SETFONT, (WPARAM)mono, TRUE);
+
+        /** Attach button — usbipd bind --force + attach --wsl + modprobe btusb */
+        HWND btn_bt_wsl = CreateWindowA("BUTTON", "-> Attach to WSL",
+            WS_CHILD|BS_PUSHBUTTON,
+            166, 230, 164, 28, hwnd, (HMENU)IDC_BT_TO_WSL, hInst, NULL);
+
+        HWND lbl_bl = CreateWindowA("STATIC", "WSL Bluetooth Controllers",
+            WS_CHILD, 346, 38, 320, 16, hwnd, NULL, hInst, NULL);
+
+        /** WSL controller listbox — hci* entries from /sys/class/bluetooth */
+        g_bt_wsl = CreateWindowA("LISTBOX", NULL,
+            WS_CHILD|WS_BORDER|WS_VSCROLL|LBS_NOINTEGRALHEIGHT,
+            346, 56, 320, 168, hwnd, (HMENU)IDC_BT_WSL, hInst, NULL);
+        SendMessage(g_bt_wsl, WM_SETFONT, (WPARAM)mono, TRUE);
+
+        /** Return button — usbipd unbind (also detaches) */
+        HWND btn_bt_win = CreateWindowA("BUTTON", "<- Return to Windows",
+            WS_CHILD|BS_PUSHBUTTON,
+            516, 230, 150, 28, hwnd, (HMENU)IDC_BT_TO_WIN, hInst, NULL);
+
+        /* ── Bottom row (below the tabs) ── */
 
         /** Refresh — re-reads registry COM ports, re-runs usbipd list, re-scans WSL */
         HWND btn_ref = CreateWindowA("BUTTON", "Refresh",
             WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
-            8, 242, 90, 28, hwnd, (HMENU)IDC_REFRESH, hInst, NULL);
+            8, 274, 90, 28, hwnd, (HMENU)IDC_REFRESH, hInst, NULL);
+
+        /** Clear stuck — detaches orphaned usbip ports from the WSL side */
+        HWND btn_unstick = CreateWindowA("BUTTON", "Clear stuck USB",
+            WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+            104, 274, 110, 28, hwnd, (HMENU)IDC_UNSTICK, hInst, NULL);
 
         /** Status label — two-line area for counts, usbipd path, errors */
         g_status = CreateWindowA("STATIC", "",
             WS_CHILD|WS_VISIBLE,
-            106, 246, 554, 36, hwnd, (HMENU)IDC_STATUS, hInst, NULL);
+            222, 278, 450, 36, hwnd, (HMENU)IDC_STATUS, hInst, NULL);
 
         /*
-         * ── Status strip (y=284): privilege left, usbipd right ──
+         * ── Status strip (y=316): privilege left, usbipd right ──
          * Both coloured via WM_CTLCOLORSTATIC: green = ok, red = problem.
-         * Width 322 each; 8px left margin, 12px gap, 8px right margin = 672.
+         * Width 326 each; 8px left margin, 12px gap, 8px right margin = 680.
          */
         g_elevated_cache = is_elevated();
         g_priv_label = CreateWindowA("STATIC",
@@ -964,26 +1106,51 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 ? "Administrator: OK  \x97  attach/detach enabled"
                 : "Administrator: NO  \x97  run as Administrator",
             WS_CHILD | WS_VISIBLE | SS_CENTER,
-            8, 284, 322, 18, hwnd, (HMENU)IDC_PRIV, hInst, NULL);
+            8, 316, 326, 18, hwnd, (HMENU)IDC_PRIV, hInst, NULL);
 
         g_usbipd_label = CreateWindowA("STATIC",
             g_usbipd[0]
                 ? "usbipd: installed  \x97  found on PATH"
                 : "usbipd: NOT FOUND  \x97  install from github.com/dorssel/usbipd-win",
             WS_CHILD | WS_VISIBLE | SS_CENTER,
-            342, 284, 322, 18, hwnd, (HMENU)IDC_USBIPD_ST, hInst, NULL);
+            346, 316, 326, 18, hwnd, (HMENU)IDC_USBIPD_ST, hInst, NULL);
 
         /* ── Author credit ── */
         HWND lbl_credit = CreateWindowA("STATIC",
             "by Matteo Vittorio Ricciutelli  \xb7  2026",
             WS_CHILD | WS_VISIBLE | SS_RIGHT,
-            8, 304, 656, 14, hwnd, (HMENU)IDC_CREDIT, hInst, NULL);
+            8, 336, 664, 14, hwnd, (HMENU)IDC_CREDIT, hInst, NULL);
+
+        /*
+         * ── Tab control (frames both pages) ──
+         * Moved to the bottom of the Z-order and given WS_CLIPSIBLINGS so it
+         * never paints over the page controls that sit on top of it.
+         */
+        g_tabs = CreateWindowA(WC_TABCONTROLA, NULL,
+            WS_CHILD|WS_VISIBLE|WS_CLIPSIBLINGS,
+            4, 4, 672, 262, hwnd, (HMENU)IDC_TABS, hInst, NULL);
+        SetWindowPos(g_tabs, HWND_BOTTOM, 0, 0, 0, 0,
+                     SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        SendMessage(g_tabs, WM_SETFONT, (WPARAM)gui, TRUE);
+        TCITEMA ti = { TCIF_TEXT };
+        ti.pszText = "Serial (COM)";
+        SendMessageA(g_tabs, TCM_INSERTITEMA, 0, (LPARAM)&ti);
+        ti.pszText = "Bluetooth";
+        SendMessageA(g_tabs, TCM_INSERTITEMA, 1, (LPARAM)&ti);
+
+        HWND pages[2][12] = {
+            { lbl_w, g_win_list, lbl_cn, GetDlgItem(hwnd, IDC_COM_EDIT), g_com_spin, btn_wsl,
+              lbl_t, g_wsl_list, lbl_tn, GetDlgItem(hwnd, IDC_TTY_EDIT), g_tty_spin, btn_win },
+            { lbl_bw, g_bt_list, btn_bt_wsl, lbl_bl, g_bt_wsl, btn_bt_win },
+        };
+        memcpy(g_pages, pages, sizeof(pages));
 
         /* Apply GUI font to all non-listbox controls */
         HWND gfx[] = { lbl_w, lbl_t, lbl_cn, lbl_tn,
-                       btn_wsl, btn_win, btn_ref, g_status,
-                       g_priv_label, g_usbipd_label, lbl_credit };
-        for (int i = 0; i < 11; i++)
+                       btn_wsl, btn_win, btn_ref, btn_unstick, g_status,
+                       g_priv_label, g_usbipd_label, lbl_credit,
+                       lbl_bw, lbl_bl, btn_bt_wsl, btn_bt_win };
+        for (int i = 0; i < (int)(sizeof(gfx) / sizeof(gfx[0])); i++)
             SendMessage(gfx[i], WM_SETFONT, (WPARAM)gui, TRUE);
 
         refresh();
@@ -1176,9 +1343,140 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetWindowTextA(g_status, st);
             /* Delay the refresh so Windows has time to re-enumerate the COM port */
             SetTimer(hwnd, TIMER_DETACH_REFRESH, 2000, NULL);
+
+        } else if (id == IDC_BT_TO_WSL || id == IDC_BT_TO_WIN) {
+            /*
+             * Move the selected USB Bluetooth adapter between Windows and WSL.
+             *
+             * To WSL:
+             *   1. `usbipd bind --busid X --force` — Bluetooth radios need a
+             *      forced bind, which takes the adapter away from Windows.
+             *   2. `usbipd attach --wsl --busid X`.
+             *   3. `modprobe btusb` as root — the WSL kernel ships the USB
+             *      Bluetooth driver as a loadable module.
+             * To Windows:
+             *   `usbipd unbind --busid X` — detaches from WSL and drops the
+             *   forced bind so Windows reloads its Bluetooth driver.
+             */
+            if (!g_usbipd[0]) {
+                SetWindowTextA(g_status, "usbipd not found. Install from github.com/dorssel/usbipd-win");
+                break;
+            }
+            if (!bt_busid(busid)) {
+                SetWindowTextA(g_status, "No Bluetooth adapter selected \x97 click Refresh.");
+                break;
+            }
+            if (id == IDC_BT_TO_WSL) {
+                char mb[512];
+                snprintf(mb, sizeof(mb),
+                    "Attach Bluetooth adapter (BUSID %s) to WSL?\r\n\r\n"
+                    "This force-binds the adapter: Windows loses Bluetooth "
+                    "(paired mice, keyboards, headsets) until you click "
+                    "\"<- Return to Windows\".",
+                    busid);
+                if (MessageBoxA(hwnd, mb, "Attach Bluetooth to WSL",
+                                MB_OKCANCEL | MB_ICONWARNING) != IDOK)
+                    break;
+
+                snprintf(st, sizeof(st),
+                    "Binding and attaching Bluetooth (BUSID %s) to WSL...", busid);
+                SetWindowTextA(g_status, st);
+                snprintf(args, sizeof(args), "bind --busid %s --force", busid);
+                usbipd_run(args);
+                snprintf(args, sizeof(args), "attach --wsl --busid %s", busid);
+                usbipd_run(args);
+
+                /* Marker instead of exit code: proc_capture only returns output,
+                 * and wsl.exe may prepend its own warnings to it */
+                char mp[RAW_SZ] = {0};
+                proc_capture("wsl.exe -u root sh -c \"modprobe btusb && echo btusb-ok\"",
+                             mp, sizeof(mp), 5000);
+                snprintf(st, sizeof(st),
+                    strstr(mp, "btusb-ok")
+                        ? "Attached Bluetooth (BUSID %s) to WSL \x97 waiting for hci to appear..."
+                        : "Attached Bluetooth (BUSID %s) to WSL, but 'modprobe btusb' failed "
+                          "\x97 run 'sudo modprobe btusb' in WSL.",
+                    busid);
+            } else {
+                snprintf(args, sizeof(args), "unbind --busid %s", busid);
+                usbipd_run(args);
+                snprintf(st, sizeof(st),
+                    "Returned Bluetooth (BUSID %s) to Windows \x97 waiting for driver to reload...",
+                    busid);
+            }
+            SetWindowTextA(g_status, st);
+            SetTimer(hwnd, TIMER_DETACH_REFRESH, 2000, NULL);
+
+        } else if (id == IDC_UNSTICK) {
+            /*
+             * Free "phantom" devices stuck on the WSL side of usbip.
+             *
+             * If Windows drops the link (unplug, usbipd restart) without WSL
+             * noticing, the vhci port stays in use and the stale /dev/tty*
+             * remains.  usbipd detach can't help — Windows no longer lists
+             * the device as Attached — so detach it from the WSL side:
+             *   echo <port> > /sys/devices/platform/vhci_hcd.0/detach
+             *
+             * Status table row: "hub port sta spd dev sockfd local_busid";
+             * sta 6 = in use, 7 = error.  Every such port is detached, so
+             * devices that still work are dropped too and need re-attaching.
+             */
+            char raw[RAW_SZ] = {0};
+            wsl_capture("cat " VHCI_SYSFS "/status 2>/dev/null", raw, sizeof(raw));
+
+            unsigned ports[MAX_DEV];
+            int  np = 0, pos = 0;
+            char list[1024] = {0};
+            for (char *ln = strtok(raw, "\r\n"); ln && np < MAX_DEV; ln = strtok(NULL, "\r\n")) {
+                char hub[4], lbus[BUSID_SZ];
+                unsigned port, sta;
+                if (sscanf(ln, "%3s %u %u %*s %*s %*s %15s", hub, &port, &sta, lbus) == 4 &&
+                    (sta == 6 || sta == 7)) {
+                    ports[np++] = port;
+                    if (pos < (int)sizeof(list) - 64)
+                        pos += snprintf(list + pos, sizeof(list) - pos,
+                                        "  port %u  (WSL busid %s)\r\n", port, lbus);
+                }
+            }
+            if (np == 0) {
+                SetWindowTextA(g_status, "No usbip ports in use in WSL \x97 nothing to clear.");
+                break;
+            }
+
+            char mb[1400];
+            snprintf(mb, sizeof(mb),
+                "Detach %d USB device(s) from the WSL side?\r\n\r\n%s\r\n"
+                "Use this when a device is stuck in WSL (stale /dev/tty*) but "
+                "usbipd no longer shows it as Attached.  Devices that still "
+                "work in WSL are disconnected too; re-attach them afterwards.",
+                np, list);
+            if (MessageBoxA(hwnd, mb, "Clear stuck USB devices",
+                            MB_OKCANCEL | MB_ICONWARNING) != IDOK)
+                break;
+
+            /* Marker per port: proc_capture gives output, not exit codes */
+            int ok = 0;
+            for (int i = 0; i < np; i++) {
+                char cmd[CMD_SZ], out[512] = {0};
+                snprintf(cmd, sizeof(cmd),
+                    "wsl.exe -u root sh -c \"echo %u > " VHCI_SYSFS "/detach && echo detach-ok\"",
+                    ports[i]);
+                proc_capture(cmd, out, sizeof(out), 5000);
+                if (strstr(out, "detach-ok")) ok++;
+            }
+            snprintf(st, sizeof(st),
+                "Cleared %d of %d stuck usbip port(s) in WSL \x97 refreshing...", ok, np);
+            SetWindowTextA(g_status, st);
+            SetTimer(hwnd, TIMER_DETACH_REFRESH, 2000, NULL);
         }
         break;
     }
+
+    case WM_NOTIFY:
+        if (((LPNMHDR)lp)->idFrom == IDC_TABS &&
+            ((LPNMHDR)lp)->code == TCN_SELCHANGE)
+            show_tab((int)SendMessage(g_tabs, TCM_GETCURSEL, 0, 0));
+        break;
 
     case WM_TIMER:
         if (wp == TIMER_DETACH_REFRESH) {
@@ -1221,11 +1519,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
  *
  * 1. Calls InitCommonControlsEx(ICC_UPDOWN_CLASS) so UPDOWN_CLASS is
  *    registered before WM_CREATE creates spinner controls.
- * 2. Calls find_usbipd() to resolve the usbipd.exe path.
+ * 2. Calls find_usbipd() to resolve the usbipd.exe path and sets
+ *    WSL_UTF8=1 so wsl.exe output stays parseable.
  * 3. Registers the "WslUsbHelper" window class.
  * 4. Uses AdjustWindowRect to compute the outer window size so the
- *    client area is exactly 672 × 298 pixels — wide enough for both
- *    columns and their controls.
+ *    client area is exactly 680 × 354 pixels — wide enough for the tab
+ *    control, both columns and their controls.
  * 5. Creates the main window (no resize handle, no maximise) and runs
  *    the Win32 message loop.
  *
@@ -1243,6 +1542,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
 
     find_usbipd();
 
+    /* wsl.exe writes its own messages (e.g. wsl.conf warnings) in UTF-16;
+     * the first NUL byte truncates the captured output, emptying the WSL
+     * lists.  WSL_UTF8=1 makes those messages plain UTF-8 lines instead. */
+    SetEnvironmentVariableA("WSL_UTF8", "1");
+
     WNDCLASSA wc     = {0};
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = hInst;
@@ -1254,8 +1558,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
 
     /*
      * Use AdjustWindowRect so the client area is exactly the size needed.
-     * Rightmost control: x=510+150=660, plus 12px padding = 672 client width.
-     * Bottom control:    y=246+36=282,  plus 16px padding = 298 client height.
+     * Rightmost control: tab x=4+672=676, plus 4px padding = 680 client width.
+     * Bottom control:    credit y=336+14=350, plus 4px padding = 354 client height.
      */
     /* Build the menu bar before AdjustWindowRect so bMenu=TRUE is accurate */
     HMENU hMenuBar = CreateMenu();
@@ -1264,7 +1568,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     AppendMenuA(hMenuBar, MF_POPUP, (UINT_PTR)hHelp, "&Help");
 
     DWORD style = WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX;
-    RECT  r     = {0, 0, 672, 322};
+    RECT  r     = {0, 0, 680, 354};
     AdjustWindowRect(&r, style, TRUE);  /* TRUE = has menu bar */
 
     HWND hwnd = CreateWindowA("WslComPortSwapper", "WSL COM Port Swapper v" APP_VERSION,
