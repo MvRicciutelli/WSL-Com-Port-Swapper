@@ -88,7 +88,7 @@
 #define MAX_DEV    64   /**< Max USB entries from usbipd list               */
 #define BUSID_SZ   16   /**< Max BUSID string ("3-2")                       */
 #define VIDPID_SZ  16   /**< Max VID:PID string ("10c4:ea60")               */
-#define CMD_SZ     640  /**< Process command-line buffer                    */
+#define CMD_SZ     1024 /**< Process command-line buffer                    */
 #define RAW_SZ     8192 /**< stdout capture buffer                          */
 
 /** WSL usbip virtual host controller (sysfs status / detach files).
@@ -250,21 +250,50 @@ static void usbipd_run(const char *args) {
     }
 }
 
+/** @brief "wsl.exe" plus `-d <distro>` once find_wsl_distro() picks one. */
+static char g_wsl[128] = "wsl.exe";
+
 /**
- * @brief Run a bash command inside WSL and capture its output.
+ * @brief Run an sh command inside WSL and capture its output.
  *
- * Launches `wsl.exe sh -c "<bash_cmd>"` directly via CreateProcessA so
- * that shell metacharacters are interpreted by the WSL shell.
+ * Launches `wsl.exe [-d distro] <opts>-e sh -c "<sh_cmd>"`.  `-e` execs sh
+ * directly; without it wsl.exe hands the line to the distro's login shell,
+ * which expands every `$` before sh ever sees it.
  *
- * @param bash_cmd  sh command; must not contain embedded double-quotes.
- * @param out       Output buffer.
- * @param size      Size of @p out.
- * @return          Non-zero if wsl.exe launched.
+ * @param opts    Extra wsl.exe options with trailing space ("" or "-u root ").
+ * @param sh_cmd  sh command; must not contain embedded double-quotes.
+ * @param out     Output buffer.
+ * @param size    Size of @p out.
+ * @param ms      Maximum wait time in milliseconds.
+ * @return        Non-zero if wsl.exe launched.
  */
-static int wsl_capture(const char *bash_cmd, char *out, int size) {
+static int wsl_exec(const char *opts, const char *sh_cmd, char *out, int size, DWORD ms) {
     char cmd[CMD_SZ];
-    snprintf(cmd, sizeof(cmd), "wsl.exe sh -c \"%s\"", bash_cmd);
-    return proc_capture(cmd, out, size, 5000);
+    snprintf(cmd, sizeof(cmd), "%s %s-e sh -c \"%s\"", g_wsl, opts, sh_cmd);
+    return proc_capture(cmd, out, size, ms);
+}
+
+/** @brief wsl_exec() as the default user with a 5 s timeout. */
+static int wsl_capture(const char *sh_cmd, char *out, int size) {
+    return wsl_exec("", sh_cmd, out, size, 5000);
+}
+
+/**
+ * @brief Point g_wsl at the first WSL distro that isn't Docker Desktop's.
+ *
+ * Docker Desktop often makes `docker-desktop` the default distro; it has no
+ * /lib/firmware, BlueZ or user tools, so WSL commands must target the real
+ * distro instead.  `wsl -l -q` lists the default first.  Needs WSL_UTF8=1.
+ */
+static void find_wsl_distro(void) {
+    char raw[1024] = {0};
+    if (!proc_capture("wsl.exe -l -q", raw, sizeof(raw), 5000)) return;
+    for (char *tok = strtok(raw, "\r\n"); tok; tok = strtok(NULL, "\r\n")) {
+        if (strncmp(tok, "docker-desktop", 14) == 0) continue;
+        /* No quotes: wsl.exe keeps them as part of the name; names can't hold spaces */
+        snprintf(g_wsl, sizeof(g_wsl), "wsl.exe -d %s", tok);
+        return;
+    }
 }
 
 /* ── elevation ───────────────────────────────────────────────────────────── */
@@ -1389,13 +1418,41 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 /* Marker instead of exit code: proc_capture only returns output,
                  * and wsl.exe may prepend its own warnings to it */
                 char mp[RAW_SZ] = {0};
-                proc_capture("wsl.exe -u root sh -c \"modprobe btusb && echo btusb-ok\"",
-                             mp, sizeof(mp), 5000);
+                wsl_exec("-u root ", "modprobe btusb && echo btusb-ok", mp, sizeof(mp), 5000);
+
+                /*
+                 * Firmware fix.  The WSL kernel loads firmware from the VM's own
+                 * root, not the distro's /lib/firmware, and can't read the .zst
+                 * files Ubuntu ships anyway.  So: give the adapter 3 s to probe,
+                 * take every firmware name the kernel failed to load from dmesg,
+                 * stage the distro's copies (plus same-name siblings, e.g. Intel
+                 * .ddc next to .sfi) decompressed in /mnt/wsl/firmware — shared
+                 * tmpfs the kernel can see — point firmware_class there and
+                 * reload btusb.  /mnt/wsl is wiped when WSL shuts down; the next
+                 * attach redoes this.
+                 */
+                char fw[RAW_SZ] = {0};
+                if (strstr(mp, "btusb-ok"))
+                    wsl_exec("-u root ",
+                        "sleep 3; F=/mnt/wsl/firmware; n=0;"
+                        " for f in $(dmesg | sed -n 's/.*\\(Direct firmware load for"
+                        "\\|Failed to load Intel firmware file\\) \\([^ ]*\\) .*/\\2/p' | sort -u);"
+                        " do for s in /lib/firmware/${f%.*}.*; do"
+                        " d=$F/${s#/lib/firmware/}; d=${d%.zst}; [ -e $d ] && continue;"
+                        " mkdir -p ${d%/*}; n=1; case $s in"
+                        " *.zst) command -v zstd >/dev/null || apt-get install -y -qq zstd >/dev/null 2>&1;"
+                        " zstd -dcq < $s > $d;; *) cp -L $s $d;; esac; done; done;"
+                        " [ $n = 1 ] && printf $F > /sys/module/firmware_class/parameters/path"
+                        " && modprobe -r btusb && modprobe btusb && echo fw-loaded",
+                        fw, sizeof(fw), 90000);
                 snprintf(st, sizeof(st),
-                    strstr(mp, "btusb-ok")
-                        ? "Attached Bluetooth (BUSID %s) to WSL \x97 waiting for hci to appear..."
-                        : "Attached Bluetooth (BUSID %s) to WSL, but 'modprobe btusb' failed "
-                          "\x97 run 'sudo modprobe btusb' in WSL.",
+                    !strstr(mp, "btusb-ok")
+                        ? "Attached Bluetooth (BUSID %s) to WSL, but 'modprobe btusb' failed "
+                          "\x97 run 'sudo modprobe btusb' in WSL."
+                    : strstr(fw, "fw-loaded")
+                        ? "Attached Bluetooth (BUSID %s) to WSL and installed its missing firmware "
+                          "\x97 waiting for hci to appear..."
+                        : "Attached Bluetooth (BUSID %s) to WSL \x97 waiting for hci to appear...",
                     busid);
             } else {
                 snprintf(args, sizeof(args), "unbind --busid %s", busid);
@@ -1457,11 +1514,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             /* Marker per port: proc_capture gives output, not exit codes */
             int ok = 0;
             for (int i = 0; i < np; i++) {
-                char cmd[CMD_SZ], out[512] = {0};
-                snprintf(cmd, sizeof(cmd),
-                    "wsl.exe -u root sh -c \"echo %u > " VHCI_SYSFS "/detach && echo detach-ok\"",
-                    ports[i]);
-                proc_capture(cmd, out, sizeof(out), 5000);
+                char sh[128], out[512] = {0};
+                snprintf(sh, sizeof(sh),
+                    "echo %u > " VHCI_SYSFS "/detach && echo detach-ok", ports[i]);
+                wsl_exec("-u root ", sh, out, sizeof(out), 5000);
                 if (strstr(out, "detach-ok")) ok++;
             }
             snprintf(st, sizeof(st),
@@ -1546,6 +1602,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
      * the first NUL byte truncates the captured output, emptying the WSL
      * lists.  WSL_UTF8=1 makes those messages plain UTF-8 lines instead. */
     SetEnvironmentVariableA("WSL_UTF8", "1");
+    find_wsl_distro();
 
     WNDCLASSA wc     = {0};
     wc.lpfnWndProc   = WndProc;

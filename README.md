@@ -118,6 +118,15 @@ usbipd unbind --busid 1-14
 
 `--force` is required because Bluetooth radios are in use by the Windows Bluetooth stack; it takes the device away from Windows until `unbind`. The right list shows `/sys/class/bluetooth/hci*` inside WSL. Using Bluetooth from Linux still needs BlueZ (`bluetoothctl`) installed and running in your distribution.
 
+#### Firmware
+
+Many adapters (e.g. Intel `ibt-*.sfi`) need firmware loaded at probe time, which fails in WSL (`Failed to load Intel firmware file ... (-2)` in `dmesg`, `bluetoothctl list` empty) for two reasons:
+
+- the WSL kernel looks for firmware in the VM's own root, not your distro's `/lib/firmware`;
+- Ubuntu ships firmware as `.zst`, and the WSL kernel can only decompress `.xz`.
+
+After attaching, the app reads the failed firmware names from `dmesg`, decompresses your distro's copies (installing `zstd` if missing) into `/mnt/wsl/firmware` — a shared tmpfs the kernel can see — sets `/sys/module/firmware_class/parameters/path` to it and reloads `btusb`. The firmware comes from your distro's `linux-firmware` package. `/mnt/wsl` is cleared when WSL shuts down; the next attach redoes it. The chip keeps its firmware until it is power-cycled, so this is often only needed after a reboot.
+
 ### WSL → Windows (detach)
 1. `usbipd list` is refreshed so the Attached state is current.
 2. VID:PID is read from the WSL kernel sysfs tree (`/sys/class/tty/ttyUSBn/device/../idVendor` and up to three parent levels) and matched against Attached entries in the usbipd table.
@@ -131,7 +140,7 @@ usbipd unbind --busid 1-14
 - **Multiple attached devices + sysfs failure** — if more than one device is Attached to WSL and the sysfs VID:PID lookup returns empty (can happen on some WSL2 kernel configurations), the tool cannot determine which device corresponds to which tty number. In this case detach manually with `usbipd detach --busid <id>`.
 - **Non-USB serial ports** — Bluetooth COM ports and virtual serial ports (e.g. from VMs) appear in the Windows list but have no USB hardware to bind, so attach will fail with a BUSID lookup error.
 - **Bluetooth detection by name** — only adapters whose usbipd description contains `Bluetooth` are listed.
-- **Single WSL distribution** — `usbipd attach --wsl` attaches to the default WSL distribution. If you have multiple distributions, set the default with `wsl --set-default <distro>`.
+- **WSL distribution** — the app runs its WSL commands in the default distribution, skipping Docker Desktop's `docker-desktop` (which has no firmware, BlueZ or user tools). With several other distributions, set the one to use with `wsl --set-default <distro>`.
 
 ---
 
