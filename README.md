@@ -28,8 +28,15 @@ Designed for embedded development workflows where you need to flash or monitor a
 | Windows 10 / 11 (x64) | Build 19041 or later for WSL2 |
 | [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) | Any distribution |
 | [usbipd-win](https://github.com/dorssel/usbipd-win/releases) | Install the `.msi`; adds the `usbipd` CLI and Windows service |
+| `bluez`, `linux-firmware` in WSL | Bluetooth tab only. BlueZ provides `bluetoothctl`; `linux-firmware` provides the adapter firmware the app loads ([details](#firmware)). `zstd` is installed automatically if missing |
 
 Install usbipd-win first. The app detects it automatically and shows a warning on startup if it is not found.
+
+For Bluetooth, inside your WSL distribution:
+
+```sh
+sudo apt install bluez linux-firmware
+```
 
 ---
 
